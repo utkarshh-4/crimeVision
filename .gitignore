@@ -9,3 +9,4 @@ data/
 .vscode/
 *.pt
 *.bin
+static/dev_scene_test.html

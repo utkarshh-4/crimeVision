@@ -12,7 +12,7 @@ import numpy as np
 
 import config
 from modules.model_registry import get_whisper
-from modules.reasoning import extract_audio_facts
+from modules.reasoning import extract_audio_events, extract_audio_facts
 from modules.utils import to_jsonable
 
 logger = logging.getLogger("crimevision.audio")
@@ -185,12 +185,14 @@ def analyze_audio(path: str | pathlib.Path, language: str = "auto") -> Dict[str,
         segments=transcription["segments"],
     )
 
+    events = extract_audio_events(transcription["segments"])
+
     result: Dict[str, Any] = {
         "language": transcription["language"],
         "duration": transcription["duration"],
         "transcript": transcription["transcript"],
         "segments": transcription["segments"],
-        "events": [],
+        "events": events,
         "location_inference": facts.get(
             "location_inference",
             {"label": "Unknown", "confidence": 0.0, "evidence": "None"},

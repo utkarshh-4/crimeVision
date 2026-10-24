@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 
 from modules.audio_analysis import _is_likely_speech, load_audio, transcribe_audio
 from modules.llm import LLMError
-from modules.reasoning import _rule_based_audio_facts, extract_audio_facts
+from modules.reasoning import (
+    _rule_based_audio_facts,
+    extract_audio_events,
+    extract_audio_facts,
+)
 
 
 def test_load_audio_validation(tmp_path):
@@ -90,3 +94,68 @@ def test_extract_audio_facts_fallback_on_error(monkeypatch):
     prob_sum = round(sum(h["probability"] for h in facts["hypotheses"]), 3)
     assert prob_sum == 1.0
     assert any("rule-based fallback" in h["explanation"] for h in facts["hypotheses"])
+
+
+def test_extract_audio_events_mock_llm_overlapping_merge(mocker):
+    """Verify overlapping audio events of the same category merge correctly."""
+    mocker.patch("modules.reasoning.is_configured", return_value=True)
+
+    mock_llm_response = {
+        "events": [
+            {
+                "segment_indices": [0],
+                "category": "Aggression",
+                "description": "Suspect pushed victim",
+                "who": "Unknown",
+                "where": "Unknown",
+                "confidence": 0.8,
+            },
+            {
+                "segment_indices": [1],
+                "category": "Aggression",
+                "description": "Suspect physically assaulted victim near doorway",
+                "who": "Suspect",
+                "where": "Doorway",
+                "confidence": 0.95,
+            },
+        ]
+    }
+    mocker.patch("modules.reasoning.chat_json", return_value=mock_llm_response)
+
+    segments = [
+        {"start_raw": 1.0, "end_raw": 3.0, "text": "He pushed me"},
+        {"start_raw": 2.5, "end_raw": 5.0, "text": "He assaulted me at the doorway"},
+    ]
+
+    events = extract_audio_events(segments)
+
+    # Must merge into exactly 1 event because they overlap and share category
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["id"] == "A1"
+    assert ev["category"] == "Aggression"
+    assert ev["start_raw"] == 1.0
+    assert ev["end_raw"] == 5.0
+    assert ev["start_raw"] <= ev["end_raw"]
+    assert ev["confidence"] == 0.95
+    # Must keep the longer description
+    assert ev["description"] == "Suspect physically assaulted victim near doorway"
+
+
+def test_extract_audio_events_fallback_keyword(mocker):
+    """Verify keyword-based fallback event extraction when LLM is unconfigured."""
+    mocker.patch("modules.reasoning.is_configured", return_value=False)
+
+    segments = [
+        {"start_raw": 1.5, "end_raw": 3.5, "text": "Watch out, he had a knife!"},
+    ]
+
+    events = extract_audio_events(segments)
+
+    assert len(events) >= 1
+    ev = events[0]
+    assert ev["id"].startswith("A")
+    assert ev["start_raw"] <= ev["end_raw"]
+    assert ev["confidence"] == 0.4
+    assert "knife" in ev["description"].lower()
+

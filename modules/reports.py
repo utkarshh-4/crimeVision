@@ -1,3 +1,947 @@
 from __future__ import annotations
 
-"""Forensic PDF report generator using ReportLab."""
+"""Forensic PDF report generation module for CrimeVision AI using ReportLab."""
+
+import datetime
+import logging
+import math
+import os
+import pathlib
+import tempfile
+import xml.sax.saxutils as saxutils
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw
+import reportlab
+from reportlab.graphics.charts.lineplots import LinePlot
+from reportlab.graphics.shapes import Drawing, Line, Rect, String
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+from reportlab.platypus import (
+    HRFlowable,
+    Image as RLImage,
+    KeepTogether,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+import config
+from modules.device import get_device
+from modules.session_store import load_session
+
+logger = logging.getLogger("crimevision.reports")
+
+# Printable dimensions for A4 with 18mm margins (18 * 2.83465 pt ≈ 51 pt)
+PAGE_MARGIN = 51.0
+PAGE_WIDTH, PAGE_HEIGHT = A4
+USABLE_WIDTH = PAGE_WIDTH - 2 * PAGE_MARGIN  # ~493.2 pt
+
+# Font registration & fallback
+_INDIC_FONT_NAME = "CrimeVisionIndic"
+_HAS_INDIC_FONT = False
+
+
+def _init_fonts() -> Tuple[str, bool]:
+    """Register Unicode font supporting Indic (Devanagari, Telugu) scripts if available on OS."""
+    global _HAS_INDIC_FONT
+    if _HAS_INDIC_FONT:
+        return _INDIC_FONT_NAME, True
+
+    font_candidates = [
+        "C:/Windows/Fonts/Nirmala.ttc",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Regular.otf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    for cand in font_candidates:
+        cand_path = pathlib.Path(cand)
+        if cand_path.is_file():
+            try:
+                pdfmetrics.registerFont(TTFont(_INDIC_FONT_NAME, str(cand_path)))
+                _HAS_INDIC_FONT = True
+                logger.info("Registered Unicode font '%s' from '%s'", _INDIC_FONT_NAME, cand)
+                return _INDIC_FONT_NAME, True
+            except Exception as exc:
+                logger.debug("Could not register font '%s': %s", cand, exc)
+
+    logger.warning("No TrueType Unicode font registered; falling back to standard Helvetica")
+    return "Helvetica", False
+
+
+def _esc(val: Any) -> str:
+    """Safely escape text for inclusion in ReportLab XML-based Paragraphs."""
+    if val is None:
+        return ""
+    return saxutils.escape(str(val))
+
+
+def _sanitize_for_font(text: str, font_name: str) -> str:
+    """Ensure string is encodable by standard Latin fonts if fallback is active."""
+    if not text:
+        return ""
+    if font_name == "Helvetica":
+        chars: List[str] = []
+        for ch in text:
+            try:
+                ch.encode("latin-1")
+                chars.append(ch)
+            except UnicodeEncodeError:
+                chars.append("?")
+        return "".join(chars)
+    return text
+
+
+class NumberedCanvas(canvas.Canvas):
+    """Two-pass canvas for dynamic total page count, header, and footer decorations."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._saved_page_states: List[Dict[str, Any]] = []
+
+    def showPage(self) -> None:
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self) -> None:
+        num_pages = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self.draw_page_decorations(num_pages)
+            super().showPage()
+        super().save()
+
+    def draw_page_decorations(self, total_pages: int) -> None:
+        self.saveState()
+        self.setFont("Helvetica-Bold", 8)
+        self.setFillColor(colors.HexColor("#64748b"))
+
+        # Header (pages after title/page 1)
+        if self._pageNumber > 1:
+            session_id = getattr(self, "session_id", "UNKNOWN")
+            self.drawString(PAGE_MARGIN, PAGE_HEIGHT - 34, f"CRIMEVISION AI | SESSION: {session_id[:16]}...")
+            now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            self.drawRightString(PAGE_WIDTH - PAGE_MARGIN, PAGE_HEIGHT - 34, f"GENERATED: {now_utc}")
+            self.setStrokeColor(colors.HexColor("#cbd5e1"))
+            self.setLineWidth(0.5)
+            self.line(PAGE_MARGIN, PAGE_HEIGHT - 38, PAGE_WIDTH - PAGE_MARGIN, PAGE_HEIGHT - 38)
+
+        # Footer (all pages)
+        self.setStrokeColor(colors.HexColor("#cbd5e1"))
+        self.setLineWidth(0.5)
+        self.line(PAGE_MARGIN, 38, PAGE_WIDTH - PAGE_MARGIN, 38)
+
+        self.setFont("Helvetica", 8)
+        self.setFillColor(colors.HexColor("#64748b"))
+        self.drawString(PAGE_MARGIN, 26, "CONFIDENTIAL – Generated by CrimeVision AI Multimodal Forensics")
+        self.drawRightString(PAGE_WIDTH - PAGE_MARGIN, 26, f"Page {self._pageNumber} of {total_pages}")
+
+        self.restoreState()
+
+
+def _draw_image_detections(
+    image_path: str,
+    detections: List[Dict[str, Any]],
+    temp_dir: str,
+    max_w: float = 480.0,
+    max_h: float = 260.0,
+) -> Optional[Tuple[str, float, float]]:
+    """Draw color-coded bounding boxes onto a copy of the image and return scaled dimensions."""
+    try:
+        p = pathlib.Path(image_path)
+        if not p.is_file():
+            return None
+
+        with Image.open(p) as orig:
+            img = orig.convert("RGB")
+
+        orig_w, orig_h = img.size
+        draw = ImageDraw.Draw(img)
+
+        # Forensic detection colors: Weapon=Red, Human=Green, Object=Blue
+        color_map = {
+            "Weapon": (239, 68, 68),
+            "Human": (16, 185, 129),
+            "Object": (59, 130, 246),
+        }
+
+        line_w = max(2, int(round(min(orig_w, orig_h) / 250.0)))
+
+        for det in detections:
+            box = det.get("box", [0, 0, 0, 0])
+            label = det.get("label", "Object")
+            conf = float(det.get("confidence", 0.0))
+            color = color_map.get(label, (59, 130, 246))
+
+            x1, y1, x2, y2 = box
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
+
+            # Draw label tag
+            tag_text = f"{label} {int(round(conf * 100))}%"
+            draw.text((x1 + 3, max(0, y1 - 12)), tag_text, fill=color)
+
+        # Scale to fit printable page area
+        scale = min(max_w / float(orig_w), max_h / float(orig_h))
+        scaled_w = round(orig_w * scale, 1)
+        scaled_h = round(orig_h * scale, 1)
+
+        out_path = os.path.join(temp_dir, f"img_annotated_{np.random.randint(100000, 999999)}.jpg")
+        img.save(out_path, "JPEG", quality=88)
+        return out_path, scaled_w, scaled_h
+    except Exception as exc:
+        logger.exception("Failed to draw image detections: %s", exc)
+        return None
+
+
+def _extract_video_keyframes(
+    video_path: str,
+    target_seconds: List[float],
+    frames_meta: List[Dict[str, Any]],
+    temp_dir: str,
+    max_frames: int = 6,
+) -> List[Tuple[str, float, str]]:
+    """Extract keyframes with OpenCV, draw detection boxes, and return temporary image paths."""
+    extracted: List[Tuple[str, float, str]] = []
+    if not video_path or not os.path.isfile(video_path):
+        return extracted
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return extracted
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = total_frames / fps if fps > 0 else 0.0
+
+        # Sort and take up to max_frames unique timestamps
+        clean_secs = sorted(list({round(float(s), 1) for s in target_seconds if 0.0 <= s <= duration}))
+        if not clean_secs:
+            # Fallback sample
+            step = max(1.0, duration / float(max_frames)) if duration > 0 else 1.0
+            clean_secs = [round(i * step, 1) for i in range(min(max_frames, max(1, int(duration))))]
+
+        clean_secs = clean_secs[:max_frames]
+
+        # Map integer seconds to frame detections
+        meta_by_sec = {int(round(float(f.get("t", 0.0)))): f for f in frames_meta}
+
+        color_map = {
+            "Weapon": (239, 68, 68),
+            "Human": (16, 185, 129),
+            "Object": (59, 130, 246),
+        }
+
+        for sec in clean_secs:
+            frame_num = int(round(sec * fps))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, min(frame_num, max(0, total_frames - 1)))
+            ret, frame_bgr = cap.read()
+            if not ret or frame_bgr is None:
+                continue
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            draw = ImageDraw.Draw(pil_img)
+
+            # Draw frame detections if present
+            f_meta = meta_by_sec.get(int(round(sec)))
+            caption_parts: List[str] = []
+            if f_meta:
+                p_cnt = f_meta.get("people_count", 0)
+                w_cnt = f_meta.get("weapon_count", 0)
+                caption_parts.append(f"People: {p_cnt}, Weapons: {w_cnt}")
+                for det in f_meta.get("detections", []):
+                    box = det.get("box", [0, 0, 0, 0])
+                    lbl = det.get("label", "Object")
+                    cnf = float(det.get("confidence", 0.0))
+                    col = color_map.get(lbl, (59, 130, 246))
+                    draw.rectangle(box, outline=col, width=2)
+                    draw.text((box[0] + 2, max(0, box[1] - 10)), f"{lbl} {int(cnf * 100)}%", fill=col)
+
+            cap_text = f"t={sec:.1f}s" + (f" ({'; '.join(caption_parts)})" if caption_parts else "")
+
+            # Resize thumbnail for report grid
+            pil_img.thumbnail((230, 160))
+            out_path = os.path.join(temp_dir, f"vid_kf_{sec:.1f}_{np.random.randint(1000, 9999)}.jpg")
+            pil_img.save(out_path, "JPEG", quality=85)
+            extracted.append((out_path, sec, cap_text))
+
+        cap.release()
+    except Exception as exc:
+        logger.exception("Error extracting video keyframes: %s", exc)
+
+    return extracted
+
+
+def _create_counts_chart(frames_data: List[Dict[str, Any]]) -> Drawing:
+    """Generate a matplotlib-free people & weapon count timeline chart using ReportLab LinePlot."""
+    d = Drawing(USABLE_WIDTH, 135)
+
+    people_pts: List[Tuple[float, float]] = []
+    weapon_pts: List[Tuple[float, float]] = []
+
+    if frames_data:
+        for i, f in enumerate(frames_data):
+            t = float(f.get("t", i))
+            p = float(f.get("people_count", 0))
+            w = float(f.get("weapon_count", 0))
+            people_pts.append((t, p))
+            weapon_pts.append((t, w))
+    else:
+        people_pts = [(0.0, 0.0), (1.0, 0.0)]
+        weapon_pts = [(0.0, 0.0), (1.0, 0.0)]
+
+    if len(people_pts) == 1:
+        people_pts.append((people_pts[0][0] + 1.0, people_pts[0][1]))
+        weapon_pts.append((weapon_pts[0][0] + 1.0, weapon_pts[0][1]))
+
+    lp = LinePlot()
+    lp.x = 35
+    lp.y = 22
+    lp.width = USABLE_WIDTH - 50
+    lp.height = 80
+    lp.data = [people_pts, weapon_pts]
+
+    # Green line for People, Red line for Weapons
+    lp.lines[0].strokeColor = colors.HexColor("#10b981")
+    lp.lines[0].strokeWidth = 2.0
+    lp.lines[1].strokeColor = colors.HexColor("#ef4444")
+    lp.lines[1].strokeWidth = 2.0
+
+    max_t = max([pt[0] for pt in people_pts] + [1.0])
+    max_val = max([pt[1] for pt in people_pts + weapon_pts] + [2.0])
+
+    lp.xValueAxis.valueMin = 0
+    lp.xValueAxis.valueMax = math.ceil(max_t)
+    lp.xValueAxis.valueStep = max(1, math.ceil(max_t / 10.0))
+    lp.xValueAxis.labels.fontSize = 7
+    lp.xValueAxis.labels.fontName = "Helvetica"
+
+    lp.yValueAxis.valueMin = 0
+    lp.yValueAxis.valueMax = math.ceil(max_val) + 1
+    lp.yValueAxis.valueStep = max(1, math.ceil((lp.yValueAxis.valueMax) / 4.0))
+    lp.yValueAxis.labels.fontSize = 7
+    lp.yValueAxis.labels.fontName = "Helvetica"
+
+    d.add(lp)
+
+    # Chart title and legends
+    d.add(String(35, 118, "Object Tracking Progression (Per-Second Detections)", fontName="Helvetica-Bold", fontSize=8, fillColor=colors.HexColor("#0f172a")))
+    # People legend
+    d.add(Line(USABLE_WIDTH - 210, 120, USABLE_WIDTH - 190, 120, strokeColor=colors.HexColor("#10b981"), strokeWidth=2))
+    d.add(String(USABLE_WIDTH - 185, 117, "People Count", fontName="Helvetica", fontSize=8, fillColor=colors.HexColor("#334155")))
+    # Weapon legend
+    d.add(Line(USABLE_WIDTH - 110, 120, USABLE_WIDTH - 90, 120, strokeColor=colors.HexColor("#ef4444"), strokeWidth=2))
+    d.add(String(USABLE_WIDTH - 85, 117, "Weapon Count", fontName="Helvetica", fontSize=8, fillColor=colors.HexColor("#334155")))
+
+    return d
+
+
+def _create_probability_bar(probability: float, width: float = 380.0, height: float = 14.0) -> Drawing:
+    """Render a graphical probability progress bar."""
+    d = Drawing(width, height)
+    clamped_prob = max(0.0, min(1.0, float(probability)))
+    bar_width = width - 50.0
+
+    # Track background
+    d.add(Rect(0, 3, bar_width, height - 6, rx=3, ry=3, fillColor=colors.HexColor("#e2e8f0"), strokeColor=None))
+    # Active fill
+    d.add(Rect(0, 3, bar_width * clamped_prob, height - 6, rx=3, ry=3, fillColor=colors.HexColor("#0284c7"), strokeColor=None))
+    # Label text
+    d.add(String(bar_width + 8, 4, f"{clamped_prob * 100:.1f}%", fontName="Helvetica-Bold", fontSize=8, fillColor=colors.HexColor("#0f172a")))
+    return d
+
+
+def build_pdf(session_id: str) -> pathlib.Path:
+    """Generate a downloadable, publication-grade forensic PDF dossier for an analyzed session.
+
+    Args:
+        session_id: 32-character hexadecimal session identifier.
+
+    Returns:
+        pathlib.Path pointing to the written PDF file under data/reports/<session_id>.pdf.
+
+    Raises:
+        KeyError: If the specified session does not exist in persistent storage.
+    """
+    session = load_session(session_id)
+    if session is None:
+        raise KeyError(f"Forensic session '{session_id}' not found.")
+
+    config.REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_path = config.REPORT_DIR / f"{session_id}.pdf"
+
+    indic_font, has_indic_font = _init_fonts()
+    temp_dir = tempfile.mkdtemp(prefix="cv_report_")
+
+    try:
+        doc = SimpleDocTemplate(
+            str(pdf_path),
+            pagesize=A4,
+            leftMargin=PAGE_MARGIN,
+            rightMargin=PAGE_MARGIN,
+            topMargin=PAGE_MARGIN,
+            bottomMargin=PAGE_MARGIN,
+        )
+
+        styles = getSampleStyleSheet()
+
+        # Custom typography styles
+        title_style = ParagraphStyle(
+            "ReportTitle",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=18,
+            leading=22,
+            textColor=colors.HexColor("#0f172a"),
+        )
+
+        subtitle_style = ParagraphStyle(
+            "ReportSubtitle",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=10,
+            leading=14,
+            textColor=colors.HexColor("#475569"),
+        )
+
+        h1_style = ParagraphStyle(
+            "Heading1_Custom",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            leading=15,
+            textColor=colors.HexColor("#0f172a"),
+            spaceBefore=14,
+            spaceAfter=6,
+        )
+
+        body_style = ParagraphStyle(
+            "Body_Custom",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8.5,
+            leading=12,
+            textColor=colors.HexColor("#1e293b"),
+        )
+
+        muted_style = ParagraphStyle(
+            "Muted_Custom",
+            parent=styles["Normal"],
+            fontName="Helvetica-Oblique",
+            fontSize=8,
+            leading=11,
+            textColor=colors.HexColor("#64748b"),
+        )
+
+        table_header_style = ParagraphStyle(
+            "TableHeader",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            textColor=colors.white,
+        )
+
+        table_cell_style = ParagraphStyle(
+            "TableCell",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=7.5,
+            leading=9.5,
+            textColor=colors.HexColor("#0f172a"),
+        )
+
+        transcript_style = ParagraphStyle(
+            "TranscriptStyle",
+            parent=styles["Normal"],
+            fontName=indic_font,
+            fontSize=8.5,
+            leading=12,
+            textColor=colors.HexColor("#0f172a"),
+        )
+
+        story: List[Any] = []
+
+        # =========================================================================
+        # 1. TITLE BLOCK & CASE METADATA TABLE
+        # =========================================================================
+        story.append(Paragraph("CRIMEVISION AI FORENSIC INTELLIGENCE DOSSIER", title_style))
+        story.append(Paragraph("Automated Multimodal Evidence Reconstruction & Evidentiary Timeline Report", subtitle_style))
+        story.append(Spacer(1, 8))
+        story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#0284c7"), spaceAfter=10))
+
+        media_map = session.get("media", {}) or {}
+        img_file = os.path.basename(media_map.get("image", "")) or "None"
+        aud_file = os.path.basename(media_map.get("audio", "")) or "None"
+        vid_file = os.path.basename(media_map.get("video", "")) or "None"
+
+        meta_rows = [
+            [Paragraph("<b>Session ID:</b>", body_style), Paragraph(_esc(session_id), body_style)],
+            [Paragraph("<b>Investigation Date (UTC):</b>", body_style), Paragraph(_esc(session.get("created_at", "N/A")), body_style)],
+            [Paragraph("<b>Files Analysed:</b>", body_style), Paragraph(_esc(f"Image: {img_file} | Audio: {aud_file} | Video: {vid_file}"), body_style)],
+            [Paragraph("<b>Execution Hardware:</b>", body_style), Paragraph(_esc(str(get_device())), body_style)],
+            [
+                Paragraph("<b>Forensic AI Models:</b>", body_style),
+                Paragraph(_esc(f"RT-DETR ({config.RTDETR_MODEL}), CLIP ({config.CLIP_MODEL}), BLIP ({config.BLIP_MODEL}), Whisper ({config.WHISPER_MODEL}), Groq LLM ({config.GROQ_MODEL})"), body_style),
+            ],
+        ]
+
+        meta_table = Table(meta_rows, colWidths=[140, USABLE_WIDTH - 140])
+        meta_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(meta_table)
+        story.append(Spacer(1, 10))
+
+        # =========================================================================
+        # 2. EXECUTIVE SUMMARY
+        # =========================================================================
+        story.append(Paragraph("1. EXECUTIVE FORENSIC SUMMARY", h1_style))
+        fusion = session.get("fusion") or {}
+        summary_text = fusion.get("summary") or "Forensic analysis executed without overall summary."
+        story.append(Paragraph(_esc(summary_text), body_style))
+        story.append(Spacer(1, 6))
+
+        # Metrics overview cards table
+        video_data = session.get("video")
+        crime_type = video_data.get("crime_type", "No Video Analysed") if video_data else "No Video Analysed"
+        crime_conf = f"{float(video_data.get('crime_confidence', 0.0)) * 100:.1f}%" if video_data and video_data.get("crime_confidence") is not None else "N/A"
+        overall_conf = f"{float(fusion.get('overall_confidence', 0.0)) * 100:.1f}%"
+        anchors_count = len(fusion.get("anchor_events", []))
+        conflicts_count = len(fusion.get("conflicts", []))
+
+        exec_metrics = [
+            [
+                Paragraph("<b>Primary Crime Classification</b>", table_header_style),
+                Paragraph("<b>Overall Confidence</b>", table_header_style),
+                Paragraph("<b>Anchor Events</b>", table_header_style),
+                Paragraph("<b>Evidentiary Conflicts</b>", table_header_style),
+            ],
+            [
+                Paragraph(f"{_esc(crime_type)} ({_esc(crime_conf)})", table_cell_style),
+                Paragraph(_esc(overall_conf), table_cell_style),
+                Paragraph(str(anchors_count), table_cell_style),
+                Paragraph(str(conflicts_count), table_cell_style),
+            ],
+        ]
+        exec_table = Table(exec_metrics, colWidths=[USABLE_WIDTH * 0.40, USABLE_WIDTH * 0.20, USABLE_WIDTH * 0.20, USABLE_WIDTH * 0.20])
+        exec_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+            ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#f1f5f9")),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(exec_table)
+        story.append(Spacer(1, 10))
+
+        # =========================================================================
+        # 3. IMAGE EVIDENCE
+        # =========================================================================
+        story.append(Paragraph("2. IMAGE EVIDENCE ANALYSIS", h1_style))
+        image_data = session.get("image")
+
+        if not image_data or not isinstance(image_data, dict):
+            story.append(Paragraph("No image evidence was submitted.", muted_style))
+        else:
+            img_path_raw = media_map.get("image", "")
+            detections = image_data.get("detections", [])
+            drawn_info = _draw_image_detections(img_path_raw, detections, temp_dir)
+
+            if drawn_info:
+                drawn_path, dw, dh = drawn_info
+                story.append(RLImage(drawn_path, width=dw, height=dh))
+                story.append(Spacer(1, 4))
+                legend_text = "<font color='#10b981'><b>[■] Human</b></font> &nbsp;&nbsp; <font color='#ef4444'><b>[■] Weapon</b></font> &nbsp;&nbsp; <font color='#3b82f6'><b>[■] Object</b></font>"
+                story.append(Paragraph(legend_text, muted_style))
+                story.append(Spacer(1, 6))
+
+            scene_info = image_data.get("scene", {})
+            scene_lbl = scene_info.get("label", "Unknown")
+            scene_cnf = f"{float(scene_info.get('confidence', 0.0)) * 100:.1f}%"
+            caption_str = image_data.get("caption", "None")
+            p_cnt = image_data.get("people_count", 0)
+            w_cnt = image_data.get("weapon_count", 0)
+
+            img_summary_table = Table([
+                [
+                    Paragraph(f"<b>Scene:</b> {_esc(scene_lbl)} ({_esc(scene_cnf)})", body_style),
+                    Paragraph(f"<b>Detections:</b> {p_cnt} Humans, {w_cnt} Weapons", body_style),
+                ],
+                [
+                    Paragraph(f"<b>Visual Caption:</b> {_esc(caption_str)}", body_style),
+                    Paragraph(f"<b>Resolution:</b> {image_data.get('width', 0)} x {image_data.get('height', 0)} px", body_style),
+                ],
+            ], colWidths=[USABLE_WIDTH * 0.5, USABLE_WIDTH * 0.5])
+            img_summary_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            story.append(img_summary_table)
+            story.append(Spacer(1, 6))
+
+            # Detections table (first 10 items)
+            if detections:
+                det_rows = [
+                    [
+                        Paragraph("<b>#</b>", table_header_style),
+                        Paragraph("<b>Label</b>", table_header_style),
+                        Paragraph("<b>Raw Label</b>", table_header_style),
+                        Paragraph("<b>Conf</b>", table_header_style),
+                        Paragraph("<b>Bounding Box [x1, y1, x2, y2]</b>", table_header_style),
+                    ]
+                ]
+                for idx, d in enumerate(detections[:10], start=1):
+                    box_str = f"[{d['box'][0]:.1f}, {d['box'][1]:.1f}, {d['box'][2]:.1f}, {d['box'][3]:.1f}]" if "box" in d else "N/A"
+                    det_rows.append([
+                        Paragraph(str(idx), table_cell_style),
+                        Paragraph(_esc(d.get("label", "Object")), table_cell_style),
+                        Paragraph(_esc(d.get("raw_label", "")), table_cell_style),
+                        Paragraph(f"{float(d.get('confidence', 0.0)) * 100:.1f}%", table_cell_style),
+                        Paragraph(box_str, table_cell_style),
+                    ])
+
+                det_table = Table(det_rows, colWidths=[25, 75, 110, 60, USABLE_WIDTH - 270])
+                det_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#ffffff"), colors.HexColor("#f8fafc")]),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ]))
+                story.append(det_table)
+
+        story.append(Spacer(1, 10))
+
+        # =========================================================================
+        # 4. AUDIO EVIDENCE
+        # =========================================================================
+        story.append(Paragraph("3. AUDIO EVIDENCE & TRANSCRIPT", h1_style))
+        audio_data = session.get("audio")
+
+        if not audio_data or not isinstance(audio_data, dict):
+            story.append(Paragraph("No audio evidence was submitted.", muted_style))
+        else:
+            lang_code = audio_data.get("language", "auto")
+            raw_transcript = str(audio_data.get("transcript", "")).strip() or "No speech transcribed."
+            safe_transcript = _sanitize_for_font(raw_transcript, indic_font)
+
+            story.append(Paragraph(f"<b>Detected Audio Language:</b> {_esc(lang_code.upper())}", body_style))
+            story.append(Spacer(1, 3))
+            story.append(Paragraph(f"<b>Full Acoustic Transcript:</b>", body_style))
+            story.append(Paragraph(f'"{_esc(safe_transcript)}"', transcript_style))
+
+            if not has_indic_font:
+                story.append(Paragraph("<i>Note: Non-Latin glyphs may be missing due to system font fallback.</i>", muted_style))
+            story.append(Spacer(1, 6))
+
+            # Audio facts & context
+            facts_dict = audio_data.get("facts", {}) or {}
+            who_val = facts_dict.get("who", "Unknown")
+            where_val = facts_dict.get("where", "Unknown")
+            suspect_val = facts_dict.get("suspect_description", "Unknown")
+            loc_inf = facts_dict.get("location_inference", {}) or {}
+            loc_label = loc_inf.get("label", "Unknown")
+
+            aud_facts_table = Table([
+                [
+                    Paragraph(f"<b>Identified Subject:</b> {_esc(who_val)}", body_style),
+                    Paragraph(f"<b>Location Mentioned:</b> {_esc(where_val)}", body_style),
+                ],
+                [
+                    Paragraph(f"<b>Suspect Description:</b> {_esc(suspect_val)}", body_style),
+                    Paragraph(f"<b>Inferred Environment:</b> {_esc(loc_label)}", body_style),
+                ],
+            ], colWidths=[USABLE_WIDTH * 0.5, USABLE_WIDTH * 0.5])
+            aud_facts_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            story.append(aud_facts_table)
+            story.append(Spacer(1, 6))
+
+            # Audio discrete events table
+            aud_events = audio_data.get("events", [])
+            if aud_events:
+                ev_rows = [
+                    [
+                        Paragraph("<b>Time Range</b>", table_header_style),
+                        Paragraph("<b>Category</b>", table_header_style),
+                        Paragraph("<b>Description</b>", table_header_style),
+                        Paragraph("<b>Confidence</b>", table_header_style),
+                    ]
+                ]
+                for a_ev in aud_events[:8]:
+                    st_val = float(a_ev.get("start_raw", 0.0))
+                    et_val = float(a_ev.get("end_raw", st_val))
+                    t_str = f"{st_val:.1f}s – {et_val:.1f}s"
+                    cnf_val = f"{float(a_ev.get('confidence', 0.0)) * 100:.0f}%"
+                    ev_rows.append([
+                        Paragraph(t_str, table_cell_style),
+                        Paragraph(_esc(a_ev.get("category", "Audio")), table_cell_style),
+                        Paragraph(_esc(a_ev.get("description", "")), table_cell_style),
+                        Paragraph(cnf_val, table_cell_style),
+                    ])
+                a_table = Table(ev_rows, colWidths=[80, 90, USABLE_WIDTH - 230, 60])
+                a_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#ffffff"), colors.HexColor("#f8fafc")]),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ]))
+                story.append(a_table)
+
+        story.append(Spacer(1, 10))
+
+        # =========================================================================
+        # 5. VIDEO EVIDENCE
+        # =========================================================================
+        story.append(Paragraph("4. VIDEO SURVEILLANCE EVIDENCE", h1_style))
+
+        if not video_data or not isinstance(video_data, dict):
+            story.append(Paragraph("No video evidence was submitted.", muted_style))
+        else:
+            vid_path_raw = media_map.get("video", "")
+            cls_info = video_data.get("classification", {})
+            probs_dict = cls_info.get("probabilities", {}) or {}
+
+            # Crime classification table
+            if probs_dict:
+                top_crimes = sorted(probs_dict.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                crime_rows = [
+                    [
+                        Paragraph("<b>Taxonomy Classification</b>", table_header_style),
+                        Paragraph("<b>Probability</b>", table_header_style),
+                        Paragraph("<b>Forensic Rationale</b>", table_header_style),
+                    ]
+                ]
+                reasoning_txt = cls_info.get("reasoning", "Surveillance visual classification.")
+                for c_name, c_prob in top_crimes:
+                    crime_rows.append([
+                        Paragraph(_esc(c_name), table_cell_style),
+                        Paragraph(f"{float(c_prob) * 100:.1f}%", table_cell_style),
+                        Paragraph(_esc(reasoning_txt if c_name == cls_info.get("primary") else "–"), table_cell_style),
+                    ])
+
+                c_table = Table(crime_rows, colWidths=[140, 80, USABLE_WIDTH - 220])
+                c_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#ffffff"), colors.HexColor("#f8fafc")]),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ]))
+                story.append(c_table)
+                story.append(Spacer(1, 8))
+
+            # LinePlot chart
+            frames_list = video_data.get("frames", [])
+            chart_drawing = _create_counts_chart(frames_list)
+            story.append(chart_drawing)
+            story.append(Spacer(1, 8))
+
+            # Up to 6 keyframes extracted from video
+            anchor_secs: List[float] = []
+            for ev in video_data.get("events", []):
+                anchor_secs.append(float(ev.get("start_raw", 0.0)))
+            for f_ev in fusion.get("timeline", []):
+                if f_ev.get("modality") == "video":
+                    anchor_secs.append(float(f_ev.get("start_raw", 0.0)))
+
+            keyframes = _extract_video_keyframes(vid_path_raw, anchor_secs, frames_list, temp_dir, max_frames=6)
+            if keyframes:
+                story.append(Paragraph("<b>Surveillance Keyframes:</b>", body_style))
+                story.append(Spacer(1, 4))
+                kf_cells: List[Any] = []
+                for kf_path, kf_sec, kf_cap in keyframes:
+                    kf_cells.append([
+                        RLImage(kf_path, width=145, height=95),
+                        Paragraph(kf_cap, table_cell_style),
+                    ])
+
+                # Arrange in 3-column rows
+                grid_rows: List[List[Any]] = []
+                for i in range(0, len(kf_cells), 3):
+                    chunk = kf_cells[i:i + 3]
+                    while len(chunk) < 3:
+                        chunk.append("")
+                    grid_rows.append(chunk)
+
+                kf_table = Table(grid_rows, colWidths=[USABLE_WIDTH / 3.0] * 3)
+                kf_table.setStyle(TableStyle([
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]))
+                story.append(kf_table)
+
+        story.append(Spacer(1, 10))
+
+        # =========================================================================
+        # 6. FUSED TIMELINE TABLE
+        # =========================================================================
+        story.append(Paragraph("5. MULTIMODAL FUSED TIMELINE", h1_style))
+        timeline_events = fusion.get("timeline", [])
+
+        if not timeline_events:
+            story.append(Paragraph("No multimodal timeline events reconstructed.", muted_style))
+        else:
+            tl_rows = [
+                [
+                    Paragraph("<b>Time Range</b>", table_header_style),
+                    Paragraph("<b>Modality</b>", table_header_style),
+                    Paragraph("<b>Category</b>", table_header_style),
+                    Paragraph("<b>Description</b>", table_header_style),
+                    Paragraph("<b>Conf</b>", table_header_style),
+                    Paragraph("<b>Anchor</b>", table_header_style),
+                    Paragraph("<b>Conflict</b>", table_header_style),
+                ]
+            ]
+
+            anchor_ids = set(fusion.get("anchor_events", []))
+            conflict_descriptions = [c.get("description", "") for c in fusion.get("conflicts", [])]
+
+            for ev in timeline_events:
+                st = float(ev.get("start_raw", 0.0))
+                et = float(ev.get("end_raw", st))
+                t_str = f"{st:.1f}s" if abs(st - et) < 0.1 else f"{st:.1f}s – {et:.1f}s"
+                mod_str = str(ev.get("modality", "")).capitalize()
+                cat_str = str(ev.get("category", "General"))
+                desc_str = str(ev.get("description", ""))
+                cnf_str = f"{float(ev.get('confidence', 0.0)) * 100:.0f}%"
+
+                is_anchor = (ev.get("id") in anchor_ids) or ev.get("is_anchor", False)
+                is_conflict = (ev.get("id") in [c.get("id") for c in fusion.get("conflicts", [])]) or any(ev.get("id") in str(c) for c in conflict_descriptions)
+
+                anchor_sym = "★" if is_anchor else "–"
+                conflict_sym = "⚠" if is_conflict else "–"
+
+                tl_rows.append([
+                    Paragraph(t_str, table_cell_style),
+                    Paragraph(_esc(mod_str), table_cell_style),
+                    Paragraph(_esc(cat_str), table_cell_style),
+                    Paragraph(_esc(desc_str), table_cell_style),
+                    Paragraph(cnf_str, table_cell_style),
+                    Paragraph(anchor_sym, table_cell_style),
+                    Paragraph(conflict_sym, table_cell_style),
+                ])
+
+            tl_table = Table(
+                tl_rows,
+                colWidths=[65, 55, 75, USABLE_WIDTH - 295, 45, 30, 25],
+                repeatRows=1,
+            )
+            tl_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#ffffff"), colors.HexColor("#f8fafc")]),
+                ("ALIGN", (4, 1), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+            ]))
+            story.append(tl_table)
+
+        story.append(Spacer(1, 10))
+
+        # =========================================================================
+        # 7. CONFLICTS, SCENARIO HYPOTHESES & LIMITATIONS
+        # =========================================================================
+        story.append(Paragraph("6. EVIDENTIARY CONFLICTS & SCENARIO HYPOTHESES", h1_style))
+
+        # Conflicts block
+        conflicts = fusion.get("conflicts", [])
+        if not conflicts:
+            story.append(Paragraph("<b>Evidentiary Conflicts:</b> None detected. Multimodal streams are coherent.", body_style))
+        else:
+            story.append(Paragraph("<b>Evidentiary Conflicts Identified:</b>", body_style))
+            for c in conflicts:
+                c_desc = c.get("description") if isinstance(c, dict) else str(c)
+                story.append(Paragraph(f"• <font color='#dc2626'><b>[Conflict]</b></font> {_esc(c_desc)}", body_style))
+        story.append(Spacer(1, 8))
+
+        # Three Scenario Hypotheses
+        story.append(Paragraph("<b>Forensic Scenario Hypotheses:</b>", body_style))
+        hypotheses = fusion.get("hypotheses", [])
+        if not hypotheses:
+            story.append(Paragraph("No scenario hypotheses generated.", muted_style))
+        else:
+            for idx, h in enumerate(hypotheses[:3], start=1):
+                h_title = h.get("title", f"Hypothesis {idx}")
+                h_prob = float(h.get("probability", 0.33))
+                h_expl = h.get("explanation", "")
+
+                story.append(Paragraph(f"<b>{idx}. {_esc(h_title)}</b>", body_style))
+                story.append(_create_probability_bar(h_prob, width=USABLE_WIDTH))
+                story.append(Paragraph(_esc(h_expl), body_style))
+                story.append(Spacer(1, 4))
+
+        story.append(Spacer(1, 10))
+
+        # Forensic Limitations Disclaimer Box
+        limitations_box = Table([
+            [
+                Paragraph(
+                    "<b>LEGAL & FORENSIC LIMITATIONS:</b><br/>"
+                    "This investigative dossier was autonomously compiled by the CrimeVision AI forensic engine. "
+                    "Cross-modal timelines, acoustic transcriptions, and probabilistic scenario classifications are "
+                    "investigative aids and do NOT constitute certified legal evidence or sworn judicial testimony. "
+                    "All findings, object bounding boxes, and witness statements must undergo independent physical "
+                    "verification by certified digital forensic analysts prior to legal proceedings.",
+                    body_style,
+                )
+            ]
+        ], colWidths=[USABLE_WIDTH])
+        limitations_box.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fef3c7")),
+            ("BOX", (0, 0), (-1, -1), 1.0, colors.HexColor("#d97706")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(KeepTogether(limitations_box))
+
+        # =========================================================================
+        # BUILD DOCUMENT
+        # =========================================================================
+        canvas_maker = NumberedCanvas
+        setattr(canvas_maker, "session_id", session_id)
+        doc.build(story, canvasmaker=canvas_maker)
+
+        logger.info("Forensic PDF report successfully built at '%s' (%d bytes)", pdf_path, pdf_path.stat().st_size)
+        return pdf_path
+
+    finally:
+        # Clean up temporary frames and annotated images
+        try:
+            for f in pathlib.Path(temp_dir).glob("*.*"):
+                f.unlink(missing_ok=True)
+            pathlib.Path(temp_dir).rmdir()
+        except Exception as exc:
+            logger.debug("Temporary file cleanup error: %s", exc)

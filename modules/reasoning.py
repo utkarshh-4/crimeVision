@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 import config
-from modules.llm import LLMError, chat_json, is_configured
+from modules.llm import LLMError, chat_json, chat_text, is_configured
 from modules.utils import round_conf, safe_float
 
 logger = logging.getLogger("crimevision.reasoning")
@@ -486,4 +486,700 @@ def extract_audio_facts(
     except Exception as exc:
         logger.warning("Audio facts extraction failed (%s). Falling back to rule-based engine.", exc)
         return _rule_based_audio_facts(clean_text, reason=f"rule-based fallback: LLM error ({exc})")
+
+
+AUDIO_EVENT_CATEGORIES: Set[str] = {
+    "Aggression",
+    "Identification",
+    "Spatial Movement",
+    "Threat",
+    "Arrival",
+    "Departure",
+    "Other",
+}
+
+
+def _dedupe_and_merge_audio_events(raw_events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge events with the same category that overlap or are within 1.0s."""
+    if not raw_events:
+        return []
+
+    sorted_events = sorted(
+        raw_events,
+        key=lambda e: (float(e.get("start_raw", 0.0)), float(e.get("end_raw", 0.0))),
+    )
+
+    merged: List[Dict[str, Any]] = []
+    for ev in sorted_events:
+        start = max(0.0, float(ev.get("start_raw", 0.0)))
+        end = max(start, float(ev.get("end_raw", start)))
+        cat = str(ev.get("category", "Other")).strip()
+        if cat not in AUDIO_EVENT_CATEGORIES:
+            cat = "Other"
+
+        item = {
+            "category": cat,
+            "description": str(ev.get("description", "")).strip(),
+            "who": str(ev.get("who", "Unknown")).strip() or "Unknown",
+            "where": str(ev.get("where", "Unknown")).strip() or "Unknown",
+            "confidence": round_conf(safe_float(ev.get("confidence", 0.4), 0.4)),
+            "start_raw": start,
+            "end_raw": end,
+        }
+
+        matched_idx = -1
+        for idx, prev in enumerate(merged):
+            if prev["category"] == item["category"]:
+                # Check overlap or gap <= 1.0s
+                if item["start_raw"] <= prev["end_raw"] + 1.0 and prev["start_raw"] <= item["end_raw"] + 1.0:
+                    matched_idx = idx
+                    break
+
+        if matched_idx != -1:
+            prev = merged[matched_idx]
+            prev["start_raw"] = min(prev["start_raw"], item["start_raw"])
+            prev["end_raw"] = max(prev["end_raw"], item["end_raw"])
+            prev["confidence"] = max(prev["confidence"], item["confidence"])
+            if len(item["description"]) > len(prev["description"]):
+                prev["description"] = item["description"]
+            if prev["who"] == "Unknown" and item["who"] != "Unknown":
+                prev["who"] = item["who"]
+            if prev["where"] == "Unknown" and item["where"] != "Unknown":
+                prev["where"] = item["where"]
+        else:
+            merged.append(item)
+
+    merged.sort(key=lambda e: float(e["start_raw"]))
+
+    final_events: List[Dict[str, Any]] = []
+    for i, ev in enumerate(merged, start=1):
+        words = ev["description"].split()
+        if len(words) > 25:
+            ev["description"] = " ".join(words[:25])
+
+        ev["id"] = f"A{i}"
+        ev["confidence"] = round_conf(ev["confidence"])
+        ev["start_raw"] = round(float(ev["start_raw"]), 3)
+        ev["end_raw"] = round(float(ev["end_raw"]), 3)
+        final_events.append(ev)
+
+    return final_events
+
+
+def _fallback_audio_events(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keyword-based deterministic fallback classifying forensic events across languages."""
+    raw_events: List[Dict[str, Any]] = []
+
+    threat_kw = {"knife", "gun", "kill", "shoot", "threat", "weapon", "बंदूक", "चाकू", "मारूंगा", "couteau", "arme", "tuer", "tupaki", "kathi"}
+    aggression_kw = {"hit", "push", "beat", "stab", "fight", "attack", "मारा", "पीटा", "frappé", "attaqué", "kottu"}
+    arrival_kw = {"came", "entered", "arrived", "inside", "आया", "घुसा", "entré", "venu", "vachadu"}
+    departure_kw = {"ran", "fled", "escaped", "left", "outside", "भाग", "भागा", "fui", "parti", "poyadu"}
+    other_kw = {"help", "police", "ambulance", "मदद", "पुलिस", "aide", "sahayam"}
+
+    for s in segments:
+        text = str(s.get("text", "")).strip()
+        if not text:
+            continue
+        text_lower = text.lower()
+        words = text.split()
+        desc = " ".join(words[:25])
+        start_raw = float(s.get("start_raw", 0.0))
+        end_raw = float(s.get("end_raw", start_raw))
+
+        matched = False
+        if any(kw in text_lower for kw in threat_kw):
+            raw_events.append({
+                "category": "Threat",
+                "description": desc,
+                "who": "Unknown",
+                "where": "Unknown",
+                "confidence": 0.4,
+                "start_raw": start_raw,
+                "end_raw": end_raw,
+            })
+            matched = True
+        if any(kw in text_lower for kw in aggression_kw):
+            raw_events.append({
+                "category": "Aggression",
+                "description": desc,
+                "who": "Unknown",
+                "where": "Unknown",
+                "confidence": 0.4,
+                "start_raw": start_raw,
+                "end_raw": end_raw,
+            })
+            matched = True
+        if any(kw in text_lower for kw in arrival_kw):
+            raw_events.append({
+                "category": "Arrival",
+                "description": desc,
+                "who": "Unknown",
+                "where": "Unknown",
+                "confidence": 0.4,
+                "start_raw": start_raw,
+                "end_raw": end_raw,
+            })
+            matched = True
+        if any(kw in text_lower for kw in departure_kw):
+            raw_events.append({
+                "category": "Departure",
+                "description": desc,
+                "who": "Unknown",
+                "where": "Unknown",
+                "confidence": 0.4,
+                "start_raw": start_raw,
+                "end_raw": end_raw,
+            })
+            matched = True
+        if not matched and any(kw in text_lower for kw in other_kw):
+            raw_events.append({
+                "category": "Other",
+                "description": desc,
+                "who": "Unknown",
+                "where": "Unknown",
+                "confidence": 0.4,
+                "start_raw": start_raw,
+                "end_raw": end_raw,
+            })
+
+    return _dedupe_and_merge_audio_events(raw_events)
+
+
+def extract_audio_events(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract and chronologically anchor forensic audio events from transcript segments."""
+    if not segments:
+        return []
+
+    if not is_configured():
+        logger.info("GROQ_API_KEY not configured. Using keyword fallback for audio events.")
+        return _fallback_audio_events(segments)
+
+    truncated_segments = segments[:120]
+    segment_lines = []
+    for idx, s in enumerate(truncated_segments):
+        start = s.get("start_raw", 0.0)
+        end = s.get("end_raw", 0.0)
+        txt = s.get("text", "")
+        segment_lines.append(f"[{idx}] {start}s-{end}s: {txt}")
+
+    system_prompt = (
+        "Classify forensic events from timestamped witness-statement segments. "
+        "Use ONLY the segments. Categories: Aggression, Identification, Spatial Movement, Threat, "
+        "Arrival, Departure, Other. "
+        'Output JSON {"events":[{"segment_indices":[int], "category": str, "description": str, '
+        '"who": str, "where": str, "confidence": float}]}. '
+        "Description <= 25 words in English. "
+        "who or where default to 'Unknown'. "
+        "Only include meaningful events (threats, physical struggle, suspect mentions, arrivals, weapon mentions). "
+        "Do not invent events."
+    )
+    user_prompt = "Classify events from the following segments:\n" + "\n".join(segment_lines)
+
+    try:
+        response = chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1000,
+        )
+
+        raw_events_llm = response.get("events", [])
+        if not isinstance(raw_events_llm, list):
+            raise LLMError("LLM output missing valid events list.")
+
+        parsed_events: List[Dict[str, Any]] = []
+        num_segments = len(truncated_segments)
+
+        for ev in raw_events_llm:
+            indices = ev.get("segment_indices", [])
+            if not isinstance(indices, list):
+                continue
+            valid_indices = [idx for idx in indices if isinstance(idx, int) and 0 <= idx < num_segments]
+            if not valid_indices:
+                continue
+
+            ref_segments = [truncated_segments[idx] for idx in valid_indices]
+            start_raw = min(float(s.get("start_raw", 0.0)) for s in ref_segments)
+            end_raw = max(float(s.get("end_raw", start_raw)) for s in ref_segments)
+
+            cat = str(ev.get("category", "Other")).strip()
+            if cat not in AUDIO_EVENT_CATEGORIES:
+                cat = "Other"
+
+            words = str(ev.get("description", "")).strip().split()
+            desc = " ".join(words[:25]) if words else "Audio forensic event"
+
+            who = str(ev.get("who", "Unknown")).strip() or "Unknown"
+            where = str(ev.get("where", "Unknown")).strip() or "Unknown"
+            conf = round_conf(safe_float(ev.get("confidence", 0.5), 0.5))
+
+            parsed_events.append({
+                "category": cat,
+                "description": desc,
+                "who": who,
+                "where": where,
+                "confidence": conf,
+                "start_raw": start_raw,
+                "end_raw": end_raw,
+            })
+
+        return _dedupe_and_merge_audio_events(parsed_events)
+
+    except Exception as exc:
+        logger.warning("LLM audio events extraction failed (%s). Falling back to keyword engine.", exc)
+        return _fallback_audio_events(segments)
+
+
+# ============================================================================
+# --- VIDEO REASONING & CRIME CLASSIFICATION ---
+# ============================================================================
+
+def _build_compact_video_sequence(
+    video_frames: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+) -> str:
+    """Build a concise, grouped sequence of frame observations and events (<= 150 lines)."""
+    if not video_frames:
+        return "No video frames available."
+
+    grouped: List[Dict[str, Any]] = []
+    for f in video_frames:
+        t = float(f.get("t", 0.0))
+        p = int(f.get("people_count", 0))
+        w = int(f.get("weapon_count", 0))
+        cap = str(f.get("caption") or "").strip()
+
+        if (
+            grouped
+            and grouped[-1]["p"] == p
+            and grouped[-1]["w"] == w
+            and grouped[-1]["cap"] == cap
+        ):
+            grouped[-1]["end_t"] = t
+        else:
+            grouped.append({"start_t": t, "end_t": t, "p": p, "w": w, "cap": cap})
+
+    lines: List[str] = []
+    for item in grouped[:130]:
+        st = int(round(item["start_t"]))
+        et = int(round(item["end_t"]))
+        t_str = f"t={st}s" if st == et else f"t={st}-{et}s"
+        cap_str = f' caption="{item["cap"]}"' if item["cap"] else ""
+        lines.append(f"{t_str} people={item['p']} weapons={item['w']}{cap_str}")
+
+    if events:
+        lines.append("\nVisual Anchor Events:")
+        for ev in events[:20]:
+            ev_id = ev.get("id", "V")
+            cat = ev.get("category", "Other")
+            st = ev.get("start_raw", 0.0)
+            et = ev.get("end_raw", st)
+            desc = ev.get("description", "")
+            lines.append(f"[{ev_id}] {st}s-{et}s ({cat}): {desc}")
+
+    return "\n".join(lines[:150])
+
+
+def _rule_based_crime_classification(
+    video_frames: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    reason: str = "rule-based fallback",
+) -> Dict[str, Any]:
+    """Heuristic fallback for crime taxonomy classification."""
+    weapon_seconds = sum(1 for f in video_frames if f.get("weapon_count", 0) > 0)
+    has_two_people = any(f.get("people_count", 0) >= 2 for f in video_frames)
+
+    has_physical_contact = any(
+        "possible physical contact" in str(ev.get("description", "")).lower()
+        or "physical contact" in str(ev.get("description", "")).lower()
+        or ev.get("category") == "Aggression"
+        for ev in events
+    )
+
+    if weapon_seconds >= 2 and has_two_people:
+        primary = "Armed Threat"
+        primary_prob = 0.5
+        expl = f"Weapon sustained for >=2s with multiple persons ({reason})"
+    elif has_physical_contact:
+        primary = "Assault"
+        primary_prob = 0.5
+        expl = f"Possible physical contact or aggression detected between subjects ({reason})"
+    else:
+        primary = "No Crime Detected"
+        primary_prob = 0.6
+        expl = f"No sustained weapons or physical contact observed ({reason})"
+
+    remaining_mass = 1.0 - primary_prob
+    other_labels = [c for c in config.CRIME_TAXONOMY if c != primary]
+    per_other = remaining_mass / float(len(other_labels))
+
+    probs: Dict[str, float] = {}
+    for cat in config.CRIME_TAXONOMY:
+        if cat == primary:
+            probs[cat] = round_conf(primary_prob)
+        else:
+            probs[cat] = round_conf(per_other)
+
+    diff = round(1.0 - sum(probs.values()), 3)
+    if diff != 0.0:
+        probs[primary] = round_conf(probs[primary] + diff)
+
+    return {
+        "crime_type": primary,
+        "crime_confidence": probs[primary],
+        "crime_probabilities": probs,
+        "reasoning": expl,
+    }
+
+
+def classify_crime(
+    video_frames: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Classify video sequence against crime taxonomy using LLM with deterministic fallback."""
+    if not is_configured():
+        logger.info("GROQ_API_KEY not configured. Using rule-based fallback for crime classification.")
+        return _rule_based_crime_classification(
+            video_frames, events, reason="rule-based fallback: LLM unconfigured"
+        )
+
+    sequence_text = _build_compact_video_sequence(video_frames, events)
+    system_prompt = (
+        "You are a forensic classifier. Based ONLY on the sequence, estimate probabilities over "
+        f"exactly this taxonomy: {config.CRIME_TAXONOMY}. Prefer 'No Crime Detected' unless there is clear "
+        'supporting evidence (weapon, physical contact, forced entry, taking items). '
+        'Output JSON {"probabilities": {label: float}, "primary": label, "reasoning": str}. '
+        'reasoning <= 40 words.'
+    )
+    user_prompt = f"Analyze this sequence:\n{sequence_text}"
+
+    try:
+        response = chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=800,
+        )
+
+        raw_probs = response.get("probabilities", {})
+        if not isinstance(raw_probs, dict):
+            raise LLMError("LLM response missing probabilities dictionary.")
+
+        cleaned_probs: Dict[str, float] = {}
+        for cat in config.CRIME_TAXONOMY:
+            cleaned_probs[cat] = safe_float(raw_probs.get(cat, 0.0), 0.0)
+
+        total_prob = sum(cleaned_probs.values())
+        if total_prob <= 0.0:
+            cleaned_probs["No Crime Detected"] = 1.0
+            total_prob = 1.0
+
+        norm_probs: Dict[str, float] = {}
+        for cat in config.CRIME_TAXONOMY:
+            norm_probs[cat] = round_conf(cleaned_probs[cat] / total_prob)
+
+        diff = round(1.0 - sum(norm_probs.values()), 3)
+        max_k = max(norm_probs, key=lambda k: norm_probs[k])
+        norm_probs[max_k] = round_conf(norm_probs[max_k] + diff)
+
+        primary = max(norm_probs, key=lambda k: norm_probs[k])
+        confidence = norm_probs[primary]
+
+        reasoning = str(response.get("reasoning", "")).strip()
+        words = reasoning.split()
+        if len(words) > 40:
+            reasoning = " ".join(words[:40])
+
+        return {
+            "crime_type": primary,
+            "crime_confidence": confidence,
+            "crime_probabilities": norm_probs,
+            "reasoning": reasoning or f"Classified as {primary}",
+        }
+
+    except Exception as exc:
+        logger.warning("Crime classification LLM failed (%s). Falling back to rule-based engine.", exc)
+        return _rule_based_crime_classification(
+            video_frames, events, reason=f"rule-based fallback: LLM error ({exc})"
+        )
+
+
+# ============================================================================
+# --- FUSION REASONING & NARRATIVE GENERATION ---
+# ============================================================================
+
+def _rule_based_fusion_narrative(
+    session_without_fusion: Dict[str, Any],
+    fusion_core: Dict[str, Any],
+    reason: str = "rule-based fallback",
+) -> Dict[str, Any]:
+    """Deterministic fallback for fusion narrative and hypotheses."""
+    timeline = fusion_core.get("timeline", [])
+    anchor_ids = set(fusion_core.get("anchor_events", []))
+    anchors = [ev for ev in timeline if ev.get("id") in anchor_ids or ev.get("is_anchor")]
+
+    anchors_sorted = sorted(anchors, key=lambda e: float(e.get("start_raw", 0.0)))
+    top_5 = anchors_sorted[:5]
+    if not top_5 and timeline:
+        top_5 = sorted(timeline, key=lambda e: float(e.get("start_raw", 0.0)))[:5]
+
+    if top_5:
+        parts = [f"At {ev.get('start_raw')}s: {ev.get('description')}" for ev in top_5]
+        summary = ". ".join(parts) + "."
+    else:
+        summary = "No significant forensic events detected across recorded modalities."
+
+    conflicts = fusion_core.get("conflicts", [])
+    if conflicts:
+        c_types = ", ".join(c.get("type", "discrepancy") for c in conflicts)
+        summary += f" Noted evidence discrepancies: {c_types}."
+
+    words = summary.split()
+    if len(words) > 120:
+        summary = " ".join(words[:120])
+
+    has_threat = any(
+        ev.get("category") in ("Threat", "Aggression")
+        or "weapon" in ev.get("description", "").lower()
+        or "contact" in ev.get("description", "").lower()
+        for ev in timeline
+    )
+
+    if has_threat:
+        hypotheses = [
+            {
+                "title": "Escalated Confrontation with Threat Indicators",
+                "explanation": f"Corroborated multimodal timeline indicates active threat or confrontation ({reason}).",
+                "probability": 0.5,
+            },
+            {
+                "title": "Premeditated Aggression or Ambush",
+                "explanation": f"Rapid presentation of weapons or physical contact suggests intentional confrontation ({reason}).",
+                "probability": 0.3,
+            },
+            {
+                "title": "Defensive Interaction during Non-Lethal Dispute",
+                "explanation": f"Actions observed may represent reactive defense rather than unprovoked criminal hostility ({reason}).",
+                "probability": 0.2,
+            },
+        ]
+    else:
+        hypotheses = [
+            {
+                "title": "Routine Non-Criminal Activity",
+                "explanation": f"Observed timeline exhibits normal activity without verified weapons or physical force ({reason}).",
+                "probability": 0.5,
+            },
+            {
+                "title": "Incident Prior or Subsequent to Recording",
+                "explanation": f"Subjects entered or departed scene without overt violence during captured interval ({reason}).",
+                "probability": 0.3,
+            },
+            {
+                "title": "Inconclusive Multimodal Monitoring",
+                "explanation": f"Recorded sensor streams lack sufficient interaction details to confirm criminal conduct ({reason}).",
+                "probability": 0.2,
+            },
+        ]
+
+    return {
+        "hypotheses": hypotheses,
+        "summary": summary,
+    }
+
+
+def generate_fusion_narrative(
+    session_without_fusion: Dict[str, Any],
+    fusion_core: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Generate forensic narrative summary (<=120 words) and exactly 3 hypotheses summing to 1.0."""
+    if not is_configured():
+        logger.info("GROQ_API_KEY not configured. Using rule-based fallback for fusion narrative.")
+        return _rule_based_fusion_narrative(
+            session_without_fusion, fusion_core, reason="rule-based fallback: LLM unconfigured"
+        )
+
+    timeline = fusion_core.get("timeline", [])
+    conflicts = fusion_core.get("conflicts", [])
+    overall_conf = fusion_core.get("overall_confidence", 0.0)
+
+    event_lines = []
+    for ev in timeline[:30]:
+        eid = ev.get("id", "")
+        mod = ev.get("modality", "")
+        st = ev.get("start_raw", 0.0)
+        et = ev.get("end_raw", st)
+        cat = ev.get("category", "")
+        desc = ev.get("description", "")
+        conf = ev.get("confidence", 0.0)
+        anchor = " [ANCHOR]" if ev.get("is_anchor") else ""
+        event_lines.append(f"[{eid}] ({mod}, {cat}, conf={conf}){anchor} {st}s-{et}s: {desc}")
+
+    conflict_lines = []
+    for c in conflicts[:10]:
+        conflict_lines.append(f"- {c.get('type')}: {c.get('description')}")
+
+    evidence_payload = {
+        "overall_confidence": overall_conf,
+        "timeline_sample": event_lines,
+        "conflicts": conflict_lines,
+    }
+
+    system_prompt = (
+        "You are a forensic analyst. Use ONLY the provided timeline, conflicts and evidence. "
+        "Do not invent facts. If evidence is insufficient say so. "
+        'Output JSON: {"hypotheses": [{"title": str, "explanation": str, "probability": float}, '
+        '...exactly 3], "summary": str}. '
+        "The 3 hypotheses must have probabilities summing to 1.0. "
+        "The summary must be <= 120 words in English."
+    )
+    user_prompt = f"Analyze the multimodal fusion evidence:\n{json.dumps(evidence_payload, indent=2)}"
+
+    try:
+        response = chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=900,
+        )
+
+        raw_hypotheses = response.get("hypotheses", [])
+        if not isinstance(raw_hypotheses, list) or len(raw_hypotheses) < 3:
+            raise LLMError(f"LLM returned invalid hypotheses count: {len(raw_hypotheses) if isinstance(raw_hypotheses, list) else 0}")
+
+        valid_items = []
+        raw_probs = []
+        for h in raw_hypotheses[:3]:
+            title = str(h.get("title", "")).strip()
+            explanation = str(h.get("explanation", "")).strip()
+            if not title:
+                raise LLMError("Hypothesis title cannot be empty.")
+            prob = safe_float(h.get("probability", 0.0), 0.0)
+            valid_items.append({"title": title, "explanation": explanation})
+            raw_probs.append(prob)
+
+        total_prob = sum(raw_probs)
+        if total_prob <= 0.0:
+            norm_probs = [0.5, 0.3, 0.2]
+        else:
+            norm_probs = [p / total_prob for p in raw_probs]
+
+        p0 = round_conf(norm_probs[0])
+        p1 = round_conf(norm_probs[1])
+        p2 = round_conf(max(0.0, 1.0 - p0 - p1))
+        final_probs = [p0, p1, round(1.0 - p0 - p1, 3)]
+
+        hypotheses = [
+            {
+                "title": valid_items[i]["title"],
+                "explanation": valid_items[i]["explanation"],
+                "probability": float(final_probs[i]),
+            }
+            for i in range(3)
+        ]
+
+        summary = str(response.get("summary", "")).strip()
+        words = summary.split()
+        if len(words) > 120:
+            summary = " ".join(words[:120])
+
+        if not summary:
+            fallback = _rule_based_fusion_narrative(session_without_fusion, fusion_core)
+            summary = fallback["summary"]
+
+        return {
+            "hypotheses": hypotheses,
+            "summary": summary,
+        }
+    except Exception as exc:
+        logger.warning("Fusion narrative LLM failed (%s). Falling back to rule-based engine.", exc)
+        return _rule_based_fusion_narrative(
+            session_without_fusion, fusion_core, reason=f"rule-based fallback: LLM error ({exc})"
+        )
+
+
+# ============================================================================
+# --- CHAT & GROUNDED FORENSIC QA ---
+# ============================================================================
+
+CHAT_SYSTEM_PROMPT = (
+    "You are CrimeVision's forensic assistant. Answer ONLY from the EVIDENCE JSON below. "
+    "If the answer is not in the evidence, reply exactly: 'The analysed evidence does not contain that information.' "
+    "Do not speculate beyond the three hypotheses provided, and label them as hypotheses. "
+    "Cite timestamps like [5.0s] when available. Be concise."
+)
+
+
+def phrase_time_facts(facts: List[str], t: float) -> str:
+    """Phrase raw temporal facts into 2-3 concise sentences without inventing facts."""
+    if not facts:
+        return f"No significant forensic activity recorded around {t:.1f}s."
+
+    fallback_text = f"At {t:.1f}s:\n" + "\n".join(f"- {f}" for f in facts)
+
+    if not is_configured():
+        return fallback_text
+
+    system_prompt = (
+        f"You are CrimeVision's forensic assistant. Phrase the following timestamped facts around {t:.1f}s "
+        "into 2-3 concise sentences. Do NOT invent, assume, or add any new facts, people, or objects."
+    )
+    user_prompt = f"Facts around {t:.1f}s:\n" + "\n".join(facts)
+
+    try:
+        response = chat_text(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=300,
+        )
+        return response.strip() or fallback_text
+    except Exception as exc:
+        logger.warning("LLM time facts phrasing failed: %s", exc)
+        return fallback_text
+
+
+def answer_forensic_question(
+    evidence_json_str: str,
+    message: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Answer a forensic chat query strictly grounded in the provided evidence JSON."""
+    if not is_configured():
+        raise LLMError("LLM unconfigured")
+
+    system_message = f"{CHAT_SYSTEM_PROMPT}\n\nEVIDENCE JSON:\n{evidence_json_str}"
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": system_message}
+    ]
+
+    # Include the last 6 history turns
+    if history and isinstance(history, list):
+        for turn in history[-6:]:
+            role = "user" if turn.get("role") == "user" else "assistant"
+            content = str(turn.get("content") or turn.get("message") or "")
+            if content:
+                messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": message})
+
+    response = chat_text(
+        messages=messages,
+        temperature=0.1,
+        max_tokens=600,
+    )
+    return response.strip()
+
+
+
+
 

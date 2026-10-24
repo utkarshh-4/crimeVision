@@ -1,11 +1,361 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CrimeVision AI</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CrimeVision AI – Multimodal Forensic Analysis</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <!-- CDN Dependencies -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 </head>
 <body>
-    <!-- CrimeVision AI Dashboard Template -->
+
+  <!-- Top Command Center Header -->
+  <header class="cv-header">
+    <div class="cv-brand">
+      <svg class="cv-logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        <path d="M12 8v4"/>
+        <path d="M12 16h.01"/>
+      </svg>
+      <h1>CrimeVision AI</h1>
+      <span class="cv-brand-tagline">Forensic Multimodal Platform</span>
+    </div>
+
+    <div class="cv-header-status">
+      <div id="devicePill" class="cv-pill">
+        <span class="cv-pill-dot"></span>
+        <span class="cv-pill-text">Device: Detecting...</span>
+      </div>
+      <div id="groqPill" class="cv-pill">
+        <span class="cv-pill-dot"></span>
+        <span class="cv-pill-text">Groq LLM: Offline</span>
+      </div>
+      <div id="sessionBadge" class="cv-pill">
+        <span class="cv-pill-dot"></span>
+        <span id="sessionText" class="cv-pill-text">Session: None</span>
+      </div>
+      <button id="btnLoadLastSession" class="cv-btn-secondary" title="Load previously analyzed session">
+        Load Last Session
+      </button>
+    </div>
+  </header>
+
+  <!-- Main 3-Column Dashboard Grid -->
+  <div class="cv-dashboard">
+
+    <!-- LEFT SIDEBAR: Upload & Progress -->
+    <aside class="cv-column cv-left-sidebar">
+      
+      <!-- Upload Card -->
+      <section id="cardUpload" class="cv-card">
+        <h2 class="cv-card-title">Evidence Ingestion</h2>
+        <form id="uploadForm">
+          <div class="cv-form-group">
+            <label for="imageInput">Image Evidence (JPG, PNG, WebP)</label>
+            <div class="cv-file-wrapper">
+              <span id="imageName" class="cv-file-name">Select Image File...</span>
+              <input type="file" id="imageInput" name="image" accept="image/*">
+            </div>
+          </div>
+
+          <div class="cv-form-group">
+            <label for="videoInput">Video Surveillance (MP4, MKV, WebM)</label>
+            <div class="cv-file-wrapper">
+              <span id="videoName" class="cv-file-name">Select Video File...</span>
+              <input type="file" id="videoInput" name="video" accept="video/*">
+            </div>
+          </div>
+
+          <div class="cv-form-group">
+            <label for="audioInput">Audio Recording (WAV, MP3, M4A)</label>
+            <div class="cv-file-wrapper">
+              <span id="audioName" class="cv-file-name">Select Audio File...</span>
+              <input type="file" id="audioInput" name="audio" accept="audio/*">
+            </div>
+          </div>
+
+          <div class="cv-form-group">
+            <label for="languageSelect">Witness Audio Language</label>
+            <select id="languageSelect" name="language" class="cv-select">
+              <option value="auto">Auto-detect Language</option>
+              <option value="en">English (en)</option>
+              <option value="te">Telugu (te)</option>
+              <option value="hi">Hindi (hi)</option>
+              <option value="fr">French (fr)</option>
+            </select>
+          </div>
+
+          <button type="submit" id="btnAnalyze" class="cv-btn-primary">
+            Analyse Evidence
+          </button>
+        </form>
+      </section>
+
+      <!-- Analysis Progress Stages -->
+      <section id="cardProgress" class="cv-card">
+        <div class="cv-card-title">
+          <span>Pipeline Status</span>
+          <span id="overallStatusBadge" class="cv-stage-badge pending">Ready</span>
+        </div>
+        <div class="cv-stage-list">
+          <div id="stageImage" class="cv-stage-item pending">
+            <span>Image Analysis</span>
+            <span class="cv-stage-badge pending">Pending</span>
+          </div>
+          <div id="stageAudio" class="cv-stage-item pending">
+            <span>Audio Transcription</span>
+            <span class="cv-stage-badge pending">Pending</span>
+          </div>
+          <div id="stageVideo" class="cv-stage-item pending">
+            <span>Video & Tracking</span>
+            <span class="cv-stage-badge pending">Pending</span>
+          </div>
+          <div id="stageFusion" class="cv-stage-item pending">
+            <span>Multimodal Fusion</span>
+            <span class="cv-stage-badge pending">Pending</span>
+          </div>
+        </div>
+      </section>
+
+    </aside>
+
+    <!-- CENTER PANEL: Tabs [Evidence | Timeline | 3D Scene | Report] -->
+    <main class="cv-center-panel">
+      
+      <!-- Navigation Tabs Bar -->
+      <nav class="cv-tabs-bar">
+        <button class="cv-tab active" data-tab="evidence" id="tabEvidence">Evidence</button>
+        <button class="cv-tab" data-tab="timeline" id="tabTimeline">Timeline</button>
+        <button class="cv-tab" data-tab="scene3d" id="tabScene3D">3D Scene</button>
+        <button class="cv-tab" data-tab="report" id="tabReport">Report</button>
+      </nav>
+
+      <div class="cv-tab-content-area">
+
+        <!-- 1. Evidence Tab -->
+        <section id="viewEvidence" class="cv-tab-view active">
+          
+          <!-- Summary Metrics Strip -->
+          <div class="cv-summary-strip">
+            <div class="cv-metric-chip">
+              <span class="cv-metric-label">Scene:</span>
+              <span id="badgeScene" class="cv-metric-val">Unknown</span>
+            </div>
+            <div class="cv-metric-chip">
+              <span class="cv-metric-label">Duration:</span>
+              <span id="badgeDuration" class="cv-metric-val">0.0s</span>
+            </div>
+            <div class="cv-metric-chip">
+              <span class="cv-metric-label">People:</span>
+              <span id="badgePeople" class="cv-metric-val">0</span>
+            </div>
+            <div class="cv-metric-chip">
+              <span class="cv-metric-label">Weapons:</span>
+              <span id="badgeWeapons" class="cv-metric-val">0</span>
+            </div>
+            <div class="cv-metric-chip">
+              <span class="cv-metric-label">Classification:</span>
+              <span id="badgeCrime" class="cv-metric-val">No Crime Detected</span>
+            </div>
+          </div>
+
+          <!-- Media Viewers Grid -->
+          <div class="cv-media-grid">
+            <!-- Image Viewer with Canvas Detections Overlay -->
+            <div class="cv-media-card">
+              <div class="cv-media-header">
+                <span>Visual Snapshot Analysis</span>
+                <span id="imgDimensions" class="cv-text-muted">--</span>
+              </div>
+              <div class="cv-canvas-wrap">
+                <img id="evidenceImg" alt="Forensic snapshot" style="display: none;">
+                <canvas id="detCanvas"></canvas>
+                <div id="imgEmptyMsg" class="cv-media-empty">No image evidence uploaded</div>
+              </div>
+              <div id="imgCaptionText" style="padding: 8px 12px; font-size: 11.5px; color: var(--text-secondary); border-top: 1px solid var(--border-color); display: none;"></div>
+            </div>
+
+            <!-- Video Player -->
+            <div class="cv-media-card">
+              <div class="cv-media-header">
+                <span>Surveillance Video Stream</span>
+                <span id="videoPlaybackTime" class="cv-text-muted">00:00 / 00:00</span>
+              </div>
+              <div class="cv-video-wrap">
+                <video id="videoPlayer" controls style="display: none;"></video>
+                <div id="vidEmptyMsg" class="cv-media-empty">No video evidence uploaded</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Audio Waveform / Player -->
+          <div class="cv-card" id="cardAudio">
+            <h3 class="cv-card-title">Audio Stream</h3>
+            <div class="cv-audio-wrap">
+              <audio id="audioPlayer" controls style="display: none;"></audio>
+              <div id="audEmptyMsg" class="cv-media-empty">No audio evidence uploaded</div>
+            </div>
+          </div>
+
+          <!-- Transcript Card with Clickable Segments -->
+          <div class="cv-card" id="cardTranscript">
+            <h3 class="cv-card-title">Witness Statement Transcript</h3>
+            <div id="transcriptSegments" class="cv-transcript-container">
+              <div class="cv-media-empty" style="padding: 10px;">No speech transcript available</div>
+            </div>
+          </div>
+
+          <!-- Crime Probability Bars -->
+          <div class="cv-card" id="cardCrimeProbabilities">
+            <h3 class="cv-card-title">Forensic Crime Taxonomy Estimations</h3>
+            <div id="crimeProbBars" class="cv-prob-grid">
+              <!-- Dynamically populated probability bars -->
+            </div>
+          </div>
+
+          <!-- Scenario Hypotheses -->
+          <div class="cv-card" id="cardHypotheses">
+            <h3 class="cv-card-title">Forensic Scenario Hypotheses (Normalized)</h3>
+            <div id="hypothesesList" class="cv-hypotheses-grid">
+              <!-- Dynamically populated 3 hypotheses -->
+            </div>
+          </div>
+
+          <!-- Conflicts Alert Card -->
+          <div class="cv-card" id="cardConflicts" style="display: none;">
+            <h3 class="cv-card-title" style="color: var(--accent-rose);">Cross-Modal Discrepancies & Conflicts</h3>
+            <div id="conflictsList" class="cv-conflict-banner">
+              <!-- Dynamically populated conflicts -->
+            </div>
+          </div>
+
+        </section>
+
+        <!-- 2. Timeline Tab -->
+        <section id="viewTimeline" class="cv-tab-view">
+          <div class="cv-card cv-chart-card">
+            <h3 class="cv-card-title">Corroborated Event Chronology (Floating Bar Chart)</h3>
+            <p style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px;">
+              Horizontal floating bars represent time spans. Click any bar to seek media player to start time. Thicker borders denote anchor events; red outlines highlight conflicts.
+            </p>
+            <div class="cv-chart-canvas-wrap">
+              <canvas id="timelineChart"></canvas>
+            </div>
+          </div>
+
+          <div class="cv-card cv-chart-card">
+            <h3 class="cv-card-title">Object & Subject Tracking per Second (With Playhead)</h3>
+            <div class="cv-chart-canvas-wrap">
+              <canvas id="countsChart"></canvas>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3. 3D Scene Tab -->
+        <section id="viewScene3D" class="cv-tab-view">
+          <div class="cv-card" style="padding: 0; overflow: hidden;">
+            <div class="cv-media-header">
+              <span>3D Spatial Scene Projection</span>
+              <span class="cv-text-muted">Interactive OrbitControls (Drag to rotate, scroll to zoom)</span>
+            </div>
+            <div id="scene3d"></div>
+          </div>
+        </section>
+
+        <!-- 4. Report Tab -->
+        <section id="viewReport" class="cv-tab-view">
+          <div class="cv-report-box">
+            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 14px;">
+              <div>
+                <h2 style="font-size: 18px; font-weight: 700; color: var(--accent-cyan);">Multimodal Forensic Investigation Report</h2>
+                <span style="font-size: 12px; color: var(--text-muted);">CrimeVision AI Automated Forensic Assessment</span>
+              </div>
+              <button id="btnDownloadReport" class="cv-btn-secondary" style="background: var(--accent-blue); color: white; padding: 8px 16px; border: none; font-weight: 600;">
+                Download PDF Report
+              </button>
+            </div>
+
+            <div style="display: flex; gap: 20px; align-items: center;">
+              <div class="cv-metric-chip" style="padding: 8px 14px;">
+                <span class="cv-metric-label">Overall Forensic Confidence:</span>
+                <span id="reportConfidenceVal" class="cv-metric-val" style="font-size: 16px;">0.000</span>
+              </div>
+              <div class="cv-metric-chip" style="padding: 8px 14px;">
+                <span class="cv-metric-label">Anchor Events:</span>
+                <span id="reportAnchorCount" class="cv-metric-val" style="font-size: 16px;">0</span>
+              </div>
+              <div class="cv-metric-chip" style="padding: 8px 14px;">
+                <span class="cv-metric-label">Identified Conflicts:</span>
+                <span id="reportConflictCount" class="cv-metric-val" style="font-size: 16px;">0</span>
+              </div>
+            </div>
+
+            <div>
+              <h3 style="font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 6px;">Executive Case Narrative</h3>
+              <p id="reportSummaryText" style="font-size: 13px; line-height: 1.6; color: var(--text-secondary); background: var(--bg-surface-elevated); padding: 14px; border-radius: var(--radius-sm); border-left: 3px solid var(--accent-cyan);">
+                No report narrative available. Please ingest and analyze evidence.
+              </p>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+
+    <!-- RIGHT SIDEBAR: Grounded Chat Assistant -->
+    <aside class="cv-column cv-right-sidebar">
+      
+      <section id="cardChat" class="cv-chat-container">
+        <div class="cv-chat-header">
+          <span style="font-weight: 600; font-size: 12.5px; color: var(--accent-cyan);">Forensic AI Chatbot</span>
+          <span style="font-size: 10px; color: var(--accent-emerald);">Grounded Assistant</span>
+        </div>
+
+        <!-- Question Suggestion Chips -->
+        <div class="cv-chat-chips" id="chatChips">
+          <button type="button" class="cv-chip" data-query="What happened?">What happened?</button>
+          <button type="button" class="cv-chip" data-query="Who was there at 5s?">Who was there at 5s?</button>
+          <button type="button" class="cv-chip" data-query="Were weapons seen?">Were weapons seen?</button>
+        </div>
+
+        <!-- Messages Area -->
+        <div id="chatMessages" class="cv-chat-messages">
+          <div class="cv-msg assistant">
+            <div class="cv-msg-bubble">
+              Hello. I am CrimeVision's grounded forensic assistant. Ingest evidence on the left or select a query to examine the case.
+            </div>
+          </div>
+        </div>
+
+        <!-- Typing Animation Indicator -->
+        <div id="chatTyping" class="cv-typing">
+          <span class="cv-typing-dot"></span>
+          <span class="cv-typing-dot"></span>
+          <span class="cv-typing-dot"></span>
+        </div>
+
+        <!-- Input Form -->
+        <form id="chatForm" class="cv-chat-input-bar">
+          <input type="text" id="chatInput" class="cv-chat-input" placeholder="Ask question citing timestamps..." autocomplete="off">
+          <button type="submit" id="btnSendChat" class="cv-chat-send">Send</button>
+        </form>
+      </section>
+
+    </aside>
+
+  </div>
+
+  <!-- Non-blocking Toasts Container -->
+  <div id="toastContainer"></div>
+
+  <!-- Application Logic Scripts -->
+  <script src="/static/js/timeline.js"></script>
+  <script src="/static/js/scene3d.js"></script>
+  <script src="/static/js/chat.js"></script>
+  <script src="/static/js/app.js"></script>
+
 </body>
 </html>
